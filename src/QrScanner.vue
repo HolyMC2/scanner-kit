@@ -139,6 +139,9 @@ async function onCandidate({ text, format }: { text: string; format: import('./t
   })
   if (result.type === 'unknown') {
     fireError()
+    // Still emit so the host can show a useful toast ('no se reconoció:
+    // <raw>') instead of the user wondering whether anything happened.
+    emit('result', result)
     return
   }
   fireSuccess()
