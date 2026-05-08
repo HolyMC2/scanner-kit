@@ -40,3 +40,11 @@ export {
   runSync, syncStatus, syncStatusColor,
 } from './networkState'
 export type { SyncStatus } from './networkState'
+
+// Phase 4: QR + label generation.
+export { generateLabel, generateSheet } from './qrGenerator'
+export type {
+  LabelLayout, GenerateLabelOpts, SheetOpts,
+  ItemLabelExtra, UbicacionLabelExtra, BoxLabelExtra,
+} from './qrGenerator'
+export { default as LabelSheet } from './LabelSheet.vue'

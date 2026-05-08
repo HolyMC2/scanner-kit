@@ -29,9 +29,11 @@
   "dependencies": {
     "@zxing/browser": "^0.1.5",
     "@zxing/library": "^0.21.3",
-    "dexie": "^4.0.10"
+    "dexie": "^4.0.10",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.5",
     "@vue/test-utils": "^2.4.6",
     "fake-indexeddb": "^6.0.0",
     "happy-dom": "^15.11.7",
