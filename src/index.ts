@@ -24,3 +24,7 @@ export {
 } from './idbCache'
 export { resolveScan, parsePrefix } from './scanResolver'
 export type { NetworkAdapter, ResolveOptions } from './scanResolver'
+export { default as QrScanner } from './QrScanner.vue'
+export { default as QrScanFab } from './QrScanFab.vue'
+export { pickAdapter } from './adapters'
+export type { ScannerAdapter, ScanCandidate } from './adapters'
