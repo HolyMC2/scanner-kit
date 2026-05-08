@@ -48,3 +48,4 @@ export type {
   ItemLabelExtra, UbicacionLabelExtra, BoxLabelExtra,
 } from './qrGenerator'
 export { default as LabelSheet } from './LabelSheet.vue'
+export { scannerOpen, openScanner } from './openScanner'

@@ -7,7 +7,7 @@
  * networkState + cache freshness, and a badge with the outbox count
  * when there are pending writes.
  */
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import QrScanner from './QrScanner.vue'
 import type { NetworkAdapter } from './scanResolver'
 import type { AppContext, ScanResult } from './types'
@@ -16,6 +16,7 @@ import {
   networkState,
   syncStatusColor,
 } from './networkState'
+import { scannerOpen } from './openScanner'
 
 withDefaults(
   defineProps<{
@@ -37,6 +38,11 @@ const emit = defineEmits<{
 }>()
 
 const open = ref(false)
+
+// Two-way bind to the shared signal so callers like a bottom-nav
+// button can do `openScanner()` from anywhere.
+watch(scannerOpen, (v) => { open.value = v }, { immediate: true })
+watch(open, (v) => { scannerOpen.value = v })
 
 onMounted(() => {
   initNetworkState()
