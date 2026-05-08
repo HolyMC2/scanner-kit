@@ -28,3 +28,15 @@ export { default as QrScanner } from './QrScanner.vue'
 export { default as QrScanFab } from './QrScanFab.vue'
 export { pickAdapter } from './adapters'
 export type { ScannerAdapter, ScanCandidate } from './adapters'
+
+// Phase 3: offline outbox + reactive network state.
+export {
+  enqueue, listOutbox, countPending, processOutbox,
+  registerOutboxHandler, retryFailed, clearOutbox, uuid,
+} from './offlineQueue'
+export type { OutboxHandler, OutboxStatus } from './offlineQueue'
+export {
+  networkState, initNetworkState, refreshOutboxCount,
+  runSync, syncStatus, syncStatusColor,
+} from './networkState'
+export type { SyncStatus } from './networkState'

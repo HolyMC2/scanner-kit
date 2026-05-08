@@ -2,11 +2,20 @@
 /**
  * Floating Action Button that toggles <QrScanner>. Each SPA mounts
  * one of these globally so the scanner is reachable from any view.
+ *
+ * Renders a status dot (green/orange/red) over the FAB based on
+ * networkState + cache freshness, and a badge with the outbox count
+ * when there are pending writes.
  */
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import QrScanner from './QrScanner.vue'
 import type { NetworkAdapter } from './scanResolver'
 import type { AppContext, ScanResult } from './types'
+import {
+  initNetworkState,
+  networkState,
+  syncStatusColor,
+} from './networkState'
 
 withDefaults(
   defineProps<{
@@ -28,6 +37,10 @@ const emit = defineEmits<{
 }>()
 
 const open = ref(false)
+
+onMounted(() => {
+  initNetworkState()
+})
 
 function handleResult(r: ScanResult) {
   open.value = false
@@ -53,6 +66,16 @@ function handleResult(r: ScanResult) {
       <line x1="21" y1="14" x2="21" y2="17" />
     </svg>
     <span v-if="label" class="qrs-fab-label">{{ label }}</span>
+    <span
+      class="qrs-fab-dot"
+      :style="{ background: syncStatusColor }"
+      :title="networkState.online ? 'Online' : 'Offline · usando caché'"
+    />
+    <span
+      v-if="networkState.outboxCount > 0"
+      class="qrs-fab-badge"
+      :title="networkState.outboxCount + ' por enviar'"
+    >{{ networkState.outboxCount }}</span>
   </button>
 
   <QrScanner
@@ -84,6 +107,29 @@ function handleResult(r: ScanResult) {
 }
 .qrs-fab:active { transform: scale(0.96); }
 .qrs-fab-icon { width: 22px; height: 22px; }
+.qrs-fab-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--fab-color);
+}
+.qrs-fab-badge {
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  background: #f59e0b;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 2px 6px;
+  min-width: 18px;
+  text-align: center;
+  border: 2px solid var(--fab-color);
+}
 .qrs-fab-label {
   font-size: 13px;
   font-weight: 600;
