@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
-  clearCache, getByBarcode, getItem, ingestItems, openCache,
+  cacheDbName, clearCache, configureCache, getByBarcode, getItem,
+  ingestItems, openCache,
 } from '../src/idbCache'
+import { clearOutbox, enqueue, listOutbox } from '../src/offlineQueue'
 import type { CachedItem } from '../src/types'
 
 const sample: CachedItem = {
@@ -58,5 +60,68 @@ describe('idbCache.ingestItems', () => {
     await ingestItems([{ ...sample, item_name: 'Funda renamed' }])
     const r = await getItem('IPN000098')
     expect(r?.item_name).toBe('Funda renamed')
+  })
+})
+
+/**
+ * IndexedDB is per-origin and /scan, /taller and /mercado share one.
+ * The database NAME is the whole isolation mechanism (§7.8b).
+ */
+describe('idbCache.configureCache', () => {
+  afterEach(async () => {
+    configureCache({ dbName: 'scanner-cache-test' })
+    await clearCache()
+    await clearOutbox()
+  })
+
+  it('is honoured by accessors that take no dbName argument', async () => {
+    configureCache({ dbName: 'kit-a' })
+    await clearCache()
+    await ingestItems([sample])
+    expect((await getItem('IPN000098'))?.item_code).toBe('IPN000098')
+
+    configureCache({ dbName: 'kit-b' })
+    await clearCache()
+    expect(cacheDbName()).toBe('kit-b')
+    // Would have been a hit before the fix, because every accessor
+    // silently re-opened the default database.
+    expect(await getItem('IPN000098')).toBeNull()
+    expect(await getByBarcode('7501234500987')).toBeNull()
+
+    configureCache({ dbName: 'kit-a' })
+    expect((await getItem('IPN000098'))?.item_code).toBe('IPN000098')
+  })
+
+  it('gives each SPA its own OUTBOX, so neither accumulates the other undrainable', async () => {
+    configureCache({ dbName: 'kit-scan' })
+    await clearOutbox()
+    await enqueue('scan_task_line', { a: 1 })
+
+    configureCache({ dbName: 'kit-taller' })
+    await clearOutbox()
+    await enqueue('add_part_to_ro', { b: 2 })
+    expect((await listOutbox()).map((e) => e.action)).toEqual(['add_part_to_ro'])
+
+    configureCache({ dbName: 'kit-scan' })
+    expect((await listOutbox()).map((e) => e.action)).toEqual(['scan_task_line'])
+    await clearOutbox()
+    configureCache({ dbName: 'kit-taller' })
+    await clearOutbox()
+  })
+
+  it('openCache(name) configures too, so later bare calls agree', async () => {
+    openCache('kit-c')
+    expect(cacheDbName()).toBe('kit-c')
+    await clearCache()
+    await ingestItems([sample])
+    expect((await getItem('IPN000098'))?.item_code).toBe('IPN000098')
+    await clearCache()
+  })
+
+  it('ignores an empty or unchanged name', () => {
+    configureCache({ dbName: 'kit-d' })
+    configureCache({})
+    configureCache({ dbName: '   ' })
+    expect(cacheDbName()).toBe('kit-d')
   })
 })
