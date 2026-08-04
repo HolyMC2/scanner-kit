@@ -1,8 +1,21 @@
 /**
  * Scan resolver — turns a raw scanned string into a typed ScanResult.
  *
- * Handles the prefix scheme + the cascade fallback for bare codes,
- * exactly as documented in mercado/docs/scanner/ARCHITECTURE.md §6.
+ * Resolution order (SPEC §9.2 — kit and server `lookup.resolve` must
+ * agree exactly):
+ *
+ *   prefix dispatch
+ *     → on a prefix-dispatch MISS: retry the FULL original string
+ *       through the bare cascade (§7.2b)
+ *     → scale-EAN structural match (when enabled)
+ *     → barcode
+ *     → Item.name
+ *     → zero-stripped barcode
+ *     → unknown
+ *
+ * The fallthrough is load-bearing: `INV` is a registered prefix and
+ * `INV-TEST-ITEM-OK` is a real Item, so without it every item code
+ * shaped like a prefix is permanently unscannable.
  *
  * Network calls are abstracted via a NetworkAdapter so the kit stays
  * independent of frappe-ui / fetch / whatever the host SPA uses. Each
@@ -10,16 +23,15 @@
  */
 
 import { getByBarcode, getItem, getUbicacion, isStale } from './idbCache'
+import {
+  PREFIX_PATTERN, getPrefix, type RegisteredPrefix,
+} from './prefixRegistry'
+import { parseScaleBarcode, type ScaleBarcodeSettings } from './scaleBarcode'
 import type {
-  AppContext, CachedItem, CachedUbicacion, ScanFormat,
-  ScanPrefix, ScanResult,
+  AppContext, CachedItem, CachedUbicacion, ScanFormat, ScanResult,
 } from './types'
 
-const KNOWN_PREFIXES: ScanPrefix[] = [
-  'ITM', 'BAR', 'UBI', 'ORD', 'CST', 'INV', 'WH', 'MOV',
-  'RMA', 'LOTE', 'SER', 'CUP',
-]
-const PREFIX_PATTERN = /^([A-Z]{2,4})-(.+)$/i
+export { parsePrefix } from './prefixRegistry'
 
 /**
  * Network adapter — host SPA passes one of these in. Methods return
@@ -35,6 +47,7 @@ export interface NetworkAdapter {
   lookupInvoice?: (name: string) => Promise<{ name: string } | null>
   lookupWarehouse?: (name: string) => Promise<{ name: string } | null>
   lookupMovimiento?: (name: string) => Promise<{ name: string } | null>
+  lookupTask?: (name: string) => Promise<{ name: string; status?: string } | null>
   /** True when the adapter can reach the network right now. */
   online?: () => boolean
 }
@@ -43,6 +56,8 @@ export interface ResolveOptions {
   context: AppContext
   network: NetworkAdapter
   format?: ScanFormat
+  /** Scale-barcode layout from `Scanner Settings`; omit to disable. */
+  scale?: ScaleBarcodeSettings
 }
 
 /** Public entry point. */
@@ -51,11 +66,10 @@ export async function resolveScan(
   opts: ResolveOptions,
 ): Promise<ScanResult> {
   const trimmed = (raw || '').trim()
-  const format = opts.format ?? 'unknown'
   const base: ScanResult = {
     raw,
     normalized: trimmed,
-    format,
+    format: opts.format ?? 'unknown',
     type: 'unknown',
     id: null,
     prefix: null,
@@ -68,52 +82,164 @@ export async function resolveScan(
   // 1. Detect prefix (case-insensitive on the prefix, preserve id case
   // because some Frappe names are case-sensitive).
   const m = trimmed.match(PREFIX_PATTERN)
-  let prefix: ScanPrefix | null = null
-  let id: string = trimmed
-  if (m) {
-    const candidate = m[1]!.toUpperCase() as ScanPrefix
-    if ((KNOWN_PREFIXES as readonly string[]).includes(candidate)) {
-      prefix = candidate
-      id = m[2]!
+  const entry = m ? getPrefix(m[1]!) : null
+
+  if (entry && m) {
+    const id = m[2]!
+    const prefixed: ScanResult = {
+      ...base, normalized: `${entry.prefix}-${id}`, prefix: entry.prefix,
+    }
+    const hit = await dispatchPrefixed(entry, id, prefixed, opts)
+    if (hit) return hit
+    // §7.2b — the prefix reading was wrong for this code. Retry the full
+    // original string as a bare code; on success the prefix reading is
+    // dropped, on failure it is kept so hosts routing by prefix (taller's
+    // cajón fallback) behave exactly as before.
+    const viaCascade = await runBareCascade(trimmed, base, opts)
+    return viaCascade ?? markOfflineMiss(prefixed, opts)
+  }
+
+  const hit = await runBareCascade(trimmed, base, opts)
+  return hit ?? markOfflineMiss(base, opts)
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Internals
+// ──────────────────────────────────────────────────────────────────
+
+/** Returns null on a miss so the caller can fall through. */
+async function dispatchPrefixed(
+  entry: RegisteredPrefix,
+  id: string,
+  base: ScanResult,
+  opts: ResolveOptions,
+): Promise<ScanResult | null> {
+  // Docnames that carry their own prefix (UBI-3700, SCT-202608-0001)
+  // must be looked up whole — stripping is what made every cajón QR
+  // resolve as unknown (finding #6).
+  const key = entry.idIncludesPrefix ? base.normalized : id
+
+  if (entry.lookup) {
+    const hit = await entry
+      .lookup(key, { normalized: base.normalized, id, online: isOnline(opts) })
+      .catch(() => null)
+    if (!hit) return null
+    return {
+      ...base,
+      type: entry.type,
+      id: hit.id ?? key,
+      payload: hit.payload ?? null,
+      source: 'network',
     }
   }
-  base.normalized = prefix ? `${prefix}-${id}` : trimmed
-  base.prefix = prefix
 
-  // 2. Prefix-driven resolution.
-  if (prefix) {
-    return await dispatchPrefixed(prefix, id, base, opts)
+  switch (entry.prefix) {
+    case 'ITM': {
+      const r = await runWithCache<CachedItem>(
+        () => getItem(key),
+        () => opts.network.lookupItem?.(key) ?? Promise.resolve(null),
+        opts,
+      )
+      return r.value ? finishItem(base, r.value, r.source, 'item') : null
+    }
+    case 'BAR': {
+      const r = await runWithCache<CachedItem>(
+        () => getByBarcode(key),
+        () => opts.network.lookupBarcode?.(key) ?? Promise.resolve(null),
+        opts,
+      )
+      return r.value ? finishItem(base, r.value, r.source, 'barcode') : null
+    }
+    case 'UBI': {
+      const r = await runWithCache<CachedUbicacion>(
+        () => getUbicacion(key),
+        () => opts.network.lookupUbicacion?.(key) ?? Promise.resolve(null),
+        opts,
+      )
+      return r.value
+        ? {
+            ...base, type: 'ubicacion', id: key,
+            payload: r.value as unknown as Record<string, unknown>,
+            source: r.source,
+          }
+        : null
+    }
+    case 'ORD':
+      return await fromNetwork(base, key, opts.network.lookupOrder, 'orden')
+    case 'CST':
+      return await fromNetwork(base, key, opts.network.lookupCustomer, 'customer')
+    case 'INV':
+      return await fromNetwork(base, key, opts.network.lookupInvoice, 'invoice')
+    case 'WH':
+      return await fromNetwork(base, key, opts.network.lookupWarehouse, 'warehouse')
+    case 'MOV':
+      return await fromNetwork(base, key, opts.network.lookupMovimiento, 'movimiento')
+    case 'SCT':
+      return await fromNetwork(base, key, opts.network.lookupTask, 'task')
+    // Reserved prefixes — recognized syntactically, no resolver wired.
+    default:
+      return null
+  }
+}
+
+async function fromNetwork(
+  base: ScanResult,
+  key: string,
+  fn: ((name: string) => Promise<Record<string, unknown> | null>) | undefined,
+  type: ScanResult['type'],
+): Promise<ScanResult | null> {
+  const v = (await fn?.(key)?.catch(() => null)) ?? null
+  return v ? { ...base, type, id: key, payload: v, source: 'network' } : null
+}
+
+/**
+ * The bare-code cascade. Order matters; first hit wins. Returns null
+ * when nothing matched so callers can decide what "unknown" means.
+ */
+async function runBareCascade(
+  code: string,
+  base: ScanResult,
+  opts: ResolveOptions,
+): Promise<ScanResult | null> {
+  // 0. Scale-printed EAN. Runs BEFORE the lookups: the embedded value
+  // changes per package so the full code can never match a barcode row,
+  // and the zero-strip tier below would mangle it into a different one.
+  const scale = opts.scale ? parseScaleBarcode(code, opts.scale) : null
+  if (scale) {
+    const r = await lookupItemOrBarcode(scale.itemDigits, opts)
+    if (r.value) {
+      return { ...finishItem(base, r.value, r.source, r.kind), scale }
+    }
   }
 
-  // 3. No prefix → cascade. Order matters; first hit wins.
-  // 3.a barcode lookup (covers ~83% of doco items, mostly because
-  //     the printed item_code is registered as a barcode literal).
+  // 1. Barcode lookup (covers ~83% of doco items, mostly because the
+  //    printed item_code is registered as a barcode literal).
   const fromBarcode = await runWithCache<CachedItem>(
-    () => getByBarcode(trimmed),
-    () => opts.network.lookupBarcode?.(trimmed) ?? Promise.resolve(null),
+    () => getByBarcode(code),
+    () => opts.network.lookupBarcode?.(code) ?? Promise.resolve(null),
     opts,
   )
   if (fromBarcode.value) {
     return finishItem(base, fromBarcode.value, fromBarcode.source, 'barcode')
   }
 
-  // 3.b direct Item.name lookup (covers items without an Item Barcode
-  //     row at all — all 213 mumu items + the 965 doco items).
+  // 2. Direct Item.name lookup (covers items without an Item Barcode
+  //    row at all — all 213 mumu items + the 965 doco items).
   const fromItem = await runWithCache<CachedItem>(
-    () => getItem(trimmed),
-    () => opts.network.lookupItem?.(trimmed) ?? Promise.resolve(null),
+    () => getItem(code),
+    () => opts.network.lookupItem?.(code) ?? Promise.resolve(null),
     opts,
   )
   if (fromItem.value) {
     return finishItem(base, fromItem.value, fromItem.source, 'item')
   }
 
-  // 3.c fuzzy barcode — strip leading zeros (EAN-13 padding edge
-  //     case where systems print '07501055361020' on the label but
-  //     the Item Barcode row has '7501055361020').
-  if (/^0+/.test(trimmed)) {
-    const stripped = trimmed.replace(/^0+/, '')
-    if (stripped && stripped !== trimmed) {
+  // 3. Fuzzy barcode — strip leading zeros (EAN-13 padding edge case
+  //    where systems print '07501055361020' on the label but the Item
+  //    Barcode row has '7501055361020').
+  if (/^0+/.test(code)) {
+    const stripped = code.replace(/^0+/, '')
+    if (stripped && stripped !== code) {
       const fuzzy = await runWithCache<CachedItem>(
         () => getByBarcode(stripped),
         () => opts.network.lookupBarcode?.(stripped) ?? Promise.resolve(null),
@@ -125,85 +251,25 @@ export async function resolveScan(
     }
   }
 
-  // 3.d nothing matched.
-  return base
+  return null
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Internals
-// ──────────────────────────────────────────────────────────────────
-
-async function dispatchPrefixed(
-  prefix: ScanPrefix,
-  id: string,
-  base: ScanResult,
+async function lookupItemOrBarcode(
+  code: string,
   opts: ResolveOptions,
-): Promise<ScanResult> {
-  switch (prefix) {
-    case 'ITM': {
-      const r = await runWithCache<CachedItem>(
-        () => getItem(id),
-        () => opts.network.lookupItem?.(id) ?? Promise.resolve(null),
-        opts,
-      )
-      return r.value ? finishItem(base, r.value, r.source, 'item') : base
-    }
-    case 'BAR': {
-      const r = await runWithCache<CachedItem>(
-        () => getByBarcode(id),
-        () => opts.network.lookupBarcode?.(id) ?? Promise.resolve(null),
-        opts,
-      )
-      return r.value ? finishItem(base, r.value, r.source, 'barcode') : base
-    }
-    case 'UBI': {
-      const r = await runWithCache<CachedUbicacion>(
-        () => getUbicacion(id),
-        () => opts.network.lookupUbicacion?.(id) ?? Promise.resolve(null),
-        opts,
-      )
-      return r.value
-        ? {
-            ...base, type: 'ubicacion', id,
-            payload: r.value as unknown as Record<string, unknown>,
-            source: r.source,
-          }
-        : base
-    }
-    case 'ORD': {
-      const v = (await opts.network.lookupOrder?.(id)) ?? null
-      return v
-        ? { ...base, type: 'orden', id, payload: v, source: 'network' }
-        : base
-    }
-    case 'CST': {
-      const v = (await opts.network.lookupCustomer?.(id)) ?? null
-      return v
-        ? { ...base, type: 'customer', id, payload: v, source: 'network' }
-        : base
-    }
-    case 'INV': {
-      const v = (await opts.network.lookupInvoice?.(id)) ?? null
-      return v
-        ? { ...base, type: 'invoice', id, payload: v, source: 'network' }
-        : base
-    }
-    case 'WH': {
-      const v = (await opts.network.lookupWarehouse?.(id)) ?? null
-      return v
-        ? { ...base, type: 'warehouse', id, payload: v, source: 'network' }
-        : base
-    }
-    case 'MOV': {
-      const v = (await opts.network.lookupMovimiento?.(id)) ?? null
-      return v
-        ? { ...base, type: 'movimiento', id, payload: v, source: 'network' }
-        : base
-    }
-    // Reserved prefixes — recognized syntactically but no resolver wired.
-    default:
-      return base
-  }
+): Promise<CacheRunResult<CachedItem> & { kind: 'item' | 'barcode' }> {
+  const bc = await runWithCache<CachedItem>(
+    () => getByBarcode(code),
+    () => opts.network.lookupBarcode?.(code) ?? Promise.resolve(null),
+    opts,
+  )
+  if (bc.value) return { ...bc, kind: 'barcode' }
+  const it = await runWithCache<CachedItem>(
+    () => getItem(code),
+    () => opts.network.lookupItem?.(code) ?? Promise.resolve(null),
+    opts,
+  )
+  return { ...it, kind: 'item' }
 }
 
 interface CacheRunResult<T> {
@@ -248,6 +314,14 @@ function isOnline(opts: ResolveOptions): boolean {
   return typeof navigator !== 'undefined' ? navigator.onLine : true
 }
 
+/**
+ * An unresolved code means two very different things depending on the
+ * radio: "the server says no such code" vs "we never got to ask".
+ */
+function markOfflineMiss(r: ScanResult, opts: ResolveOptions): ScanResult {
+  return isOnline(opts) ? r : { ...r, offlineMiss: true }
+}
+
 function finishItem(
   base: ScanResult,
   item: CachedItem,
@@ -261,19 +335,4 @@ function finishItem(
     payload: item as unknown as Record<string, unknown>,
     source,
   }
-}
-
-/**
- * Convenience factory: parses a code without doing any IO. Useful
- * for tests and for code paths that just need to know the prefix.
- */
-export function parsePrefix(raw: string): { prefix: ScanPrefix | null; id: string } {
-  const trimmed = (raw || '').trim()
-  const m = trimmed.match(PREFIX_PATTERN)
-  if (!m) return { prefix: null, id: trimmed }
-  const candidate = m[1]!.toUpperCase() as ScanPrefix
-  if ((KNOWN_PREFIXES as readonly string[]).includes(candidate)) {
-    return { prefix: candidate, id: m[2]! }
-  }
-  return { prefix: null, id: trimmed }
 }

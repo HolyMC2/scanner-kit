@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveScan, type NetworkAdapter } from '../src/scanResolver'
-import { clearCache, ingestItems, openCache } from '../src/idbCache'
-import type { CachedItem } from '../src/types'
+import { clearCache, ingestItems, ingestUbicaciones, openCache } from '../src/idbCache'
+import { registerPrefix, resetPrefixRegistry } from '../src/prefixRegistry'
+import type { CachedItem, CachedUbicacion } from '../src/types'
 
 function mockItem(over: Partial<CachedItem> = {}): CachedItem {
   return {
@@ -35,6 +36,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await clearCache()
+  resetPrefixRegistry()
 })
 
 describe('resolveScan: prefix path', () => {
@@ -129,5 +131,151 @@ describe('resolveScan: cascade for bare codes', () => {
     const r = await resolveScan('   ', { context: 'mercado', network: emptyAdapter() })
     expect(r.type).toBe('unknown')
     expect(r.normalized).toBe('')
+  })
+})
+
+describe('resolveScan: prefix-dispatch miss falls through (§7.2b)', () => {
+  it('resolves INV-TEST-ITEM-OK as an item — a real doco-mirror Item', async () => {
+    await ingestItems([mockItem({ item_code: 'INV-TEST-ITEM-OK', barcodes: [] })])
+    const r = await resolveScan('INV-TEST-ITEM-OK', {
+      context: 'scanner',
+      network: emptyAdapter(),
+    })
+    expect(r.type === 'item' || r.type === 'barcode').toBe(true)
+    expect(r.id).toBe('INV-TEST-ITEM-OK')
+  })
+
+  it('retries the FULL original string, not the stripped id', async () => {
+    const seen: string[] = []
+    await resolveScan('INV-TEST-ITEM-LOW', {
+      context: 'scanner',
+      network: {
+        online: () => true,
+        lookupInvoice: async () => null,
+        lookupBarcode: async (c) => { seen.push(c); return null },
+        lookupItem: async (c) => { seen.push(c); return null },
+      },
+    })
+    expect(seen).toContain('INV-TEST-ITEM-LOW')
+    expect(seen).not.toContain('TEST-ITEM-LOW')
+  })
+
+  it('drops the rejected prefix reading when the cascade succeeds', async () => {
+    await ingestItems([mockItem({ item_code: 'INV-TEST-ITEM-OK', barcodes: [] })])
+    const r = await resolveScan('INV-TEST-ITEM-OK', {
+      context: 'scanner', network: emptyAdapter(),
+    })
+    expect(r.prefix).toBeNull()
+  })
+
+  it('keeps the prefix when the cascade also misses, so hosts routing by prefix still work', async () => {
+    const r = await resolveScan('UBI-3700', { context: 'taller', network: emptyAdapter() })
+    expect(r.type).toBe('unknown')
+    expect(r.prefix).toBe('UBI')
+    expect(r.normalized).toBe('UBI-3700')
+  })
+
+  it('does not re-run the cascade when the prefix resolves', async () => {
+    let bare = 0
+    const r = await resolveScan('ORD-RO-0001', {
+      context: 'taller',
+      network: {
+        online: () => true,
+        lookupOrder: async (n) => ({ name: n, status: 'Abierta' }),
+        lookupItem: async () => { bare++; return null },
+        lookupBarcode: async () => { bare++; return null },
+      },
+    })
+    expect(r.type).toBe('orden')
+    expect(bare).toBe(0)
+  })
+})
+
+describe('resolveScan: UBI docname includes the prefix (finding #6)', () => {
+  const bin: CachedUbicacion = {
+    name: 'UBI-3700', label: 'Estante 2', parent: 'UBI-0001',
+    hierarchy: ['Zona A', 'Estante 2'], cached_at: Date.now(),
+  }
+
+  it('hits the cache on the full docname', async () => {
+    await ingestUbicaciones([bin])
+    const r = await resolveScan('UBI-3700', { context: 'taller', network: emptyAdapter() })
+    expect(r.type).toBe('ubicacion')
+    expect(r.id).toBe('UBI-3700')
+    expect(r.source).toBe('cache')
+  })
+
+  it('asks the network for the full docname, never the stripped id', async () => {
+    const asked: string[] = []
+    const r = await resolveScan('ubi-3700', {
+      context: 'taller',
+      network: {
+        online: () => true,
+        lookupUbicacion: async (n) => { asked.push(n); return n === 'UBI-3700' ? bin : null },
+      },
+    })
+    expect(asked).toEqual(['UBI-3700'])
+    expect(r.type).toBe('ubicacion')
+    expect(r.id).toBe('UBI-3700')
+  })
+})
+
+describe('resolveScan: registered prefixes', () => {
+  it('dispatches to a host-supplied lookup', async () => {
+    const lookup = vi.fn().mockResolvedValue({ payload: { name: 'RMA-9' } })
+    registerPrefix('RMA', { type: 'devolucion', idIncludesPrefix: true, lookup })
+    const r = await resolveScan('RMA-9', { context: 'scanner', network: emptyAdapter() })
+    expect(lookup).toHaveBeenCalledWith('RMA-9', expect.objectContaining({ id: '9' }))
+    expect(r.type).toBe('devolucion')
+    expect(r.id).toBe('RMA-9')
+  })
+
+  it('falls through to the cascade when the host lookup misses', async () => {
+    await ingestItems([mockItem({ item_code: 'RMA-9', barcodes: [] })])
+    registerPrefix('RMA', { type: 'devolucion', lookup: async () => null })
+    const r = await resolveScan('RMA-9', { context: 'scanner', network: emptyAdapter() })
+    expect(r.id).toBe('RMA-9')
+    expect(r.type === 'item' || r.type === 'barcode').toBe(true)
+  })
+})
+
+describe('resolveScan: offlineMiss', () => {
+  it('marks an unresolved code offline when the radio is down', async () => {
+    const r = await resolveScan('GIBBERISH', {
+      context: 'scanner', network: { online: () => false },
+    })
+    expect(r.type).toBe('unknown')
+    expect(r.offlineMiss).toBe(true)
+  })
+
+  it('leaves it unset when the server genuinely said no', async () => {
+    const r = await resolveScan('GIBBERISH', {
+      context: 'scanner', network: emptyAdapter(),
+    })
+    expect(r.offlineMiss).toBeUndefined()
+  })
+})
+
+describe('resolveScan: scale barcodes run before the lookups', () => {
+  const scale = { enabled: true, prefix: '2', itemDigits: 5, valueDigits: 5 }
+
+  it('looks up the embedded item digits and carries the weight', async () => {
+    await ingestItems([mockItem({ item_code: '01234', barcodes: [] })])
+    // 2 | 01234 | 01250 | 8  → item 01234, 1.250 kg
+    const r = await resolveScan('201234012508', {
+      context: 'scanner', network: emptyAdapter(), scale: { ...scale, totalLength: 12 },
+    })
+    expect(r.id).toBe('01234')
+    expect(r.scale?.value).toBeCloseTo(1.25)
+    expect(r.scale?.isWeight).toBe(true)
+  })
+
+  it('ignores an ordinary EAN-13 whose prefix does not match', async () => {
+    await ingestItems([mockItem()])
+    const r = await resolveScan('7501055361020', {
+      context: 'scanner', network: emptyAdapter(), scale,
+    })
+    expect(r.id).toBe('MOD00001')
+    expect(r.scale).toBeUndefined()
   })
 })
