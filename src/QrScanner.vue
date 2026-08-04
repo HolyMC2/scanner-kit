@@ -10,7 +10,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { resolveScan, type NetworkAdapter } from './scanResolver'
 import type { AppContext, ScanResult } from './types'
+import type { ScaleBarcodeSettings } from './scaleBarcode'
 import { pickAdapter, type ScannerAdapter } from './adapters'
+import { createDedupGate, resolveDedupWindow, type DedupPolicy } from './dedup'
+import { useCameraControls } from './cameraControls'
 
 const props = withDefaults(
   defineProps<{
@@ -26,8 +29,23 @@ const props = withDefaults(
      * a row.
      */
     sameCodeCooldownMs?: number
+    /** Alias accepted for parity with <EmbeddedScanner>. */
+    sameCodeHoldMs?: number
+    /**
+     * See src/dedup.ts. A navigating scanner wants the fixed cooldown —
+     * re-emitting the same code just re-triggers the same route.
+     */
+    dedupPolicy?: DedupPolicy
+    /** Scale-barcode layout from `Scanner Settings`; omit to disable. */
+    scale?: ScaleBarcodeSettings
   }>(),
-  { closeOnSuccess: true, sameCodeCooldownMs: 1500 },
+  {
+    closeOnSuccess: true,
+    sameCodeCooldownMs: undefined,
+    sameCodeHoldMs: undefined,
+    dedupPolicy: 'fixed-cooldown',
+    scale: undefined,
+  },
 )
 
 const emit = defineEmits<{
@@ -46,7 +64,12 @@ const flashSuccess = ref(false)
 const flashError = ref(false)
 const manualOpen = ref(false)
 const manualValue = ref('')
-const lastDecoded = ref<{ text: string; at: number } | null>(null)
+const camera = useCameraControls()
+
+const gate = createDedupGate(
+  () => props.dedupPolicy,
+  () => resolveDedupWindow(props.sameCodeHoldMs, props.sameCodeCooldownMs, 1500),
+)
 
 const showHeader = computed(() => props.open)
 
@@ -79,7 +102,7 @@ async function startCamera() {
       return
     }
     stream.value = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' } },
+      video: { facingMode: { ideal: camera.facing.value } },
       audio: false,
     })
     if (video.value) {
@@ -89,6 +112,7 @@ async function startCamera() {
       video.value.muted = true
       await video.value.play().catch(() => { /* autoplay blocked is OK */ })
     }
+    await camera.attach(stream.value)
     adapter.value = await pickAdapter()
     if (video.value) {
       await adapter.value.start(video.value, onCandidate)
@@ -115,27 +139,27 @@ async function stopCamera() {
     stream.value = null
   }
   if (video.value) video.value.srcObject = null
+  camera.release()
+  gate.reset()
   status.value = 'idle'
   manualOpen.value = false
   manualValue.value = ''
-  lastDecoded.value = null
+}
+
+async function flipCamera() {
+  camera.flip()
+  await stopCamera()
+  if (props.open) await startCamera()
 }
 
 async function onCandidate({ text, format }: { text: string; format: import('./types').ScanFormat }) {
   if (!text) return
-  const now = Date.now()
-  if (
-    lastDecoded.value
-    && lastDecoded.value.text === text
-    && now - lastDecoded.value.at < props.sameCodeCooldownMs
-  ) {
-    return
-  }
-  lastDecoded.value = { text, at: now }
+  if (!gate.accept(text)) return
   const result = await resolveScan(text, {
     context: props.context,
     network: props.network,
     format,
+    scale: props.scale,
   })
   if (result.type === 'unknown') {
     fireError()
@@ -196,9 +220,31 @@ function onBackdrop() {
             <span class="qrs-dot" />
             <span>{{ statusLabel(status) }}</span>
           </div>
-          <button class="qrs-close" aria-label="Cerrar escáner" @click="emit('close')">
-            ✕
-          </button>
+          <div class="qrs-tools">
+            <button
+              v-if="camera.torchSupported.value"
+              class="qrs-tool"
+              type="button"
+              :class="{ on: camera.torchOn.value }"
+              :aria-pressed="camera.torchOn.value"
+              aria-label="Linterna"
+              @click="camera.toggleTorch()"
+            >
+              🔦
+            </button>
+            <button
+              v-if="camera.flipSupported.value"
+              class="qrs-tool"
+              type="button"
+              aria-label="Cambiar cámara"
+              @click="flipCamera()"
+            >
+              🔄
+            </button>
+            <button class="qrs-close" aria-label="Cerrar escáner" @click="emit('close')">
+              ✕
+            </button>
+          </div>
         </header>
 
         <div class="qrs-stage">
@@ -304,7 +350,13 @@ export default { name: 'QrScanner' }
 .qrs-status-denied .qrs-dot,
 .qrs-status-unsupported .qrs-dot,
 .qrs-status-error .qrs-dot { background: #ef4444; }
-.qrs-close {
+.qrs-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.qrs-close,
+.qrs-tool {
   background: rgba(0,0,0,0.5);
   color: #fff;
   border: none;
@@ -313,6 +365,9 @@ export default { name: 'QrScanner' }
   border-radius: 50%;
   font-size: 18px;
   cursor: pointer;
+}
+.qrs-tool.on {
+  background: rgba(245,158,11,0.85);
 }
 .qrs-stage {
   flex: 1;
