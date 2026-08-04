@@ -115,3 +115,31 @@ describe('generateSheet', () => {
     expect(pages.length).toBeGreaterThan(1)
   })
 })
+
+/**
+ * §9.3: items encode a bare POS-compatible scan code and entities whose
+ * docname already carries a prefix encode the docname. Only a caller
+ * that genuinely wants one synthesised passes `prefix`.
+ */
+describe('generateLabel: prefix is optional', () => {
+  it('encodes the bare id when no prefix is given', async () => {
+    const svg = await generateLabel({
+      id: '7501055361020', layout: 'box', extra: { name: 'Caja 1' },
+    })
+    expect(svg).toContain('7501055361020')
+    expect(svg).not.toContain('undefined-')
+  })
+
+  it('still synthesises PREFIX-id when asked', async () => {
+    const svg = await generateLabel({
+      prefix: 'ITM', id: 'MOD00001', layout: 'box',
+    })
+    expect(svg).toContain('ITM-MOD00001')
+  })
+
+  it('encodes a docname that already carries its prefix verbatim', async () => {
+    const svg = await generateLabel({ id: 'UBI-3700', layout: 'box' })
+    expect(svg).toContain('UBI-3700')
+    expect(svg).not.toContain('UBI-UBI-3700')
+  })
+})

@@ -36,7 +36,14 @@ export interface BoxLabelExtra {
 }
 
 export interface GenerateLabelOpts {
-  prefix: ScanPrefix
+  /**
+   * Synthetic prefix to prepend. OPTIONAL by §9.3: items encode a bare
+   * POS-compatible scan code (`serial_no > batch_no > barcode >
+   * item_code`) and entities whose docname already carries its prefix
+   * (`UBI-3700`, `SCT-202608-0001`) encode the docname as-is. Pass a
+   * prefix only when the payload genuinely needs one synthesised.
+   */
+  prefix?: ScanPrefix
   id: string
   layout: LabelLayout
   extra?: ItemLabelExtra & UbicacionLabelExtra & BoxLabelExtra
@@ -93,7 +100,7 @@ export async function generateLabel(opts: GenerateLabelOpts): Promise<string> {
   const qrSize = Math.min(w, h) * dims.qrFrac
   const padding = 2  // mm
 
-  const code = `${opts.prefix}-${opts.id}`
+  const code = opts.prefix ? `${opts.prefix}-${opts.id}` : opts.id
   // Render QR at ~10× target px so it scales crisp; viewBox absorbs.
   const qrInnerPx = Math.round(qrSize * 10)
   const qrInner = await qrAsRects(code, qrInnerPx)
