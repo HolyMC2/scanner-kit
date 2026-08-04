@@ -42,7 +42,12 @@ export interface ScaleBarcodeSettings {
    * it is what stops a 10x inventory error.
    */
   valueDivisor?: number
-  /** Full code length. Default 13 (EAN-13). */
+  /**
+   * Full code length. DERIVED from the layout when omitted —
+   * `prefix + item + value + check`, which is what §9.2's structural
+   * match states. Hardcoding 13 here would silently disagree with the
+   * server's parser on any layout that does not happen to sum to 13.
+   */
   totalLength?: number
   /** 1-indexed. Default = totalLength. 0 disables the check digit. */
   checkDigitPosition?: number
@@ -51,14 +56,22 @@ export interface ScaleBarcodeSettings {
 
 const DIGITS = /^\d+$/
 
+/**
+ * SPEC §4.2. 1 prefix + 5 item + 6 value + 1 check = 13, a real EAN-13.
+ * The v1 draft's 5 value digits summed to 12 and could never match one.
+ */
 export const DEFAULT_SCALE_SETTINGS: Required<
-  Pick<ScaleBarcodeSettings, 'prefix' | 'itemDigits' | 'valueDigits' | 'valueIsWeight' | 'totalLength'>
+  Pick<ScaleBarcodeSettings, 'prefix' | 'itemDigits' | 'valueDigits' | 'valueIsWeight'>
 > = {
   prefix: '2',
   itemDigits: 5,
-  valueDigits: 5,
+  valueDigits: 6,
   valueIsWeight: true,
-  totalLength: 13,
+}
+
+/** Last 1-indexed position a segment reads, decimals included. */
+function segmentEnd(seg: ScaleSegment): number {
+  return seg.start - 1 + seg.length + (seg.decimals ?? 0)
 }
 
 /** EAN check digit over `digits`, 1-indexed, even positions weighted 3. */
@@ -97,18 +110,23 @@ export function parseScaleBarcode(
   const raw = (code || '').trim()
   if (!raw || !DIGITS.test(raw)) return null
 
-  const totalLength = settings.totalLength ?? DEFAULT_SCALE_SETTINGS.totalLength
-  if (raw.length !== totalLength) return null
-
   const prefix = settings.prefix ?? DEFAULT_SCALE_SETTINGS.prefix
-  if (prefix && !raw.startsWith(prefix)) return null
-
   const itemDigits = settings.itemDigits ?? DEFAULT_SCALE_SETTINGS.itemDigits
   const valueDigits = settings.valueDigits ?? DEFAULT_SCALE_SETTINGS.valueDigits
   const itemSeg = settings.itemSegment
     ?? { start: prefix.length + 1, length: itemDigits }
   const valueSeg = settings.valueSegment
     ?? { start: prefix.length + 1 + itemDigits, length: valueDigits }
+
+  // Derive the code length from the layout unless the host states one,
+  // so the kit and `scanner_kit.services.scale_barcode` agree by
+  // construction rather than by both being wired the same way.
+  const hasCheckDigit = settings.checkDigitPosition !== 0
+  const totalLength = settings.totalLength
+    ?? Math.max(segmentEnd(itemSeg), segmentEnd(valueSeg)) + (hasCheckDigit ? 1 : 0)
+  if (raw.length !== totalLength) return null
+
+  if (prefix && !raw.startsWith(prefix)) return null
 
   const itemWindow = readWindow(raw, itemSeg)
   const valueWindow = readWindow(raw, valueSeg)

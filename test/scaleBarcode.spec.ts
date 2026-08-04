@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { eanCheckDigit, parseScaleBarcode } from '../src/scaleBarcode'
+import {
+  DEFAULT_SCALE_SETTINGS, eanCheckDigit, parseScaleBarcode,
+} from '../src/scaleBarcode'
 
-// Defaults from Scanner Settings §4.2: prefix 2, 5 item digits,
-// 5 value digits, weight — 1 + 5 + 5 + check = 12, so a real EAN-13
-// layout uses a 2-digit prefix or 6 value digits. Both are exercised.
+// Scanner Settings §4.2: prefix 2, 5 item digits, 6 value digits,
+// weight — 1 + 5 + 6 + check = 13, a real EAN-13.
 const s13 = { prefix: '2', itemDigits: 5, valueDigits: 6, totalLength: 13 }
 
 describe('parseScaleBarcode: structure', () => {
@@ -32,6 +33,60 @@ describe('parseScaleBarcode: structure', () => {
 
   it('honours enabled: false', () => {
     expect(parseScaleBarcode('2012340012507', { ...s13, enabled: false })).toBeNull()
+  })
+})
+
+/**
+ * The server mirror (`scanner_kit.services.scale_barcode`) derives the
+ * code length as prefix + item + value + check, which is what §9.2's
+ * structural match states. A hardcoded 13 here would disagree with it
+ * on every layout that does not happen to sum to 13 — starting with
+ * the one W3 found. Deriving makes the two agree by construction
+ * instead of relying on the PWA passing the right number.
+ */
+describe('parseScaleBarcode: totalLength derives from the layout', () => {
+  it('matches the server formula on the shipped defaults', () => {
+    const derived = DEFAULT_SCALE_SETTINGS.prefix.length
+      + DEFAULT_SCALE_SETTINGS.itemDigits + DEFAULT_SCALE_SETTINGS.valueDigits + 1
+    expect(derived).toBe(13)
+    // No totalLength given, so the parser must derive the same 13.
+    const r = parseScaleBarcode('2012340012507', {})
+    expect(r).not.toBeNull()
+    expect(r!.itemDigits).toBe('01234')
+  })
+
+  it('accepts a 12-char layout with no totalLength stated', () => {
+    const twelve = { prefix: '2', itemDigits: 5, valueDigits: 5 }
+    const r = parseScaleBarcode('201234012508', twelve)
+    expect(r).not.toBeNull()
+    expect(r!.itemDigits).toBe('01234')
+    expect(r!.value).toBeCloseTo(1.25)
+    // …and rejects a 13-char code under that same layout.
+    expect(parseScaleBarcode('2012340012507', twelve)).toBeNull()
+  })
+
+  it('drops the check digit from the derivation when it is disabled', () => {
+    const noCheck = {
+      prefix: '2', itemDigits: 5, valueDigits: 5, checkDigitPosition: 0,
+    }
+    const r = parseScaleBarcode('20123401250', noCheck)   // 1+5+5 = 11
+    expect(r).not.toBeNull()
+    expect(r!.checkDigit).toBeNull()
+    expect(parseScaleBarcode('201234012508', noCheck)).toBeNull()
+  })
+
+  it('derives from explicit segments too', () => {
+    const r = parseScaleBarcode('2012340012507', {
+      prefix: '2',
+      itemSegment: { start: 2, length: 5 },
+      valueSegment: { start: 7, length: 3, decimals: 3 },
+    })
+    expect(r).not.toBeNull()
+    expect(r!.value).toBeCloseTo(1.25)
+  })
+
+  it('an explicit totalLength still wins', () => {
+    expect(parseScaleBarcode('2012340012507', { ...s13, totalLength: 14 })).toBeNull()
   })
 })
 
