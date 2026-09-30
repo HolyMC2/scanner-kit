@@ -7,7 +7,7 @@
  * context. Result is emitted via the `result` event; the host wires
  * navigation. See ARCHITECTURE.md §5.
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { resolveScan, type NetworkAdapter } from './scanResolver'
 import type { AppContext, ScanResult } from './types'
 import type { ScaleBarcodeSettings } from './scaleBarcode'
@@ -56,7 +56,19 @@ const emit = defineEmits<{
 
 const video = ref<HTMLVideoElement | null>(null)
 const stream = ref<MediaStream | null>(null)
-const adapter = ref<ScannerAdapter | null>(null)
+interface ScanSession {
+  stream: MediaStream | null
+  adapter: ScannerAdapter | null
+  timers: Set<ReturnType<typeof setTimeout>>
+}
+let session: ScanSession | null = null
+function isCurrent(run: ScanSession) { return session === run && props.open }
+function releaseStream(value: MediaStream | null) {
+  for (const track of value?.getTracks() ?? []) track.stop()
+}
+function stopAdapter(value: ScannerAdapter | null) {
+  try { void value?.stop().catch(() => { /* cleanup is best effort */ }) } catch { /* noop */ }
+}
 
 const status = ref<'idle' | 'starting' | 'running' | 'denied' | 'unsupported' | 'error'>('idle')
 const errorMsg = ref<string>('')
@@ -92,7 +104,9 @@ onBeforeUnmount(() => {
 })
 
 async function startCamera() {
-  if (status.value === 'starting' || status.value === 'running') return
+  if (session) return
+  const run: ScanSession = { stream: null, adapter: null, timers: new Set() }
+  session = run
   status.value = 'starting'
   errorMsg.value = ''
   try {
@@ -101,24 +115,40 @@ async function startCamera() {
       errorMsg.value = 'Cámara no disponible. Usa el ingreso manual.'
       return
     }
-    stream.value = await navigator.mediaDevices.getUserMedia({
+    const acquired = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: camera.facing.value } },
       audio: false,
     })
-    if (video.value) {
-      video.value.srcObject = stream.value
-      // iOS needs both attributes set + a kicked play().
-      video.value.setAttribute('playsinline', 'true')
-      video.value.muted = true
-      await video.value.play().catch(() => { /* autoplay blocked is OK */ })
-    }
-    await camera.attach(stream.value)
-    adapter.value = await pickAdapter()
-    if (video.value) {
-      await adapter.value.start(video.value, onCandidate)
-    }
+    if (!isCurrent(run)) { releaseStream(acquired); return }
+    run.stream = acquired
+    stream.value = acquired
+    await nextTick()
+    if (!isCurrent(run)) return
+    const player = video.value
+    if (!player) { stopCamera(); return }
+    player.srcObject = acquired
+    // iOS needs both attributes set + a kicked play().
+    player.setAttribute('playsinline', 'true')
+    player.muted = true
+    await player.play().catch(() => { /* autoplay blocked is OK */ })
+    if (!isCurrent(run)) return
+    await camera.attach(acquired)
+    if (!isCurrent(run)) return
+    const selected = await pickAdapter()
+    if (!isCurrent(run)) { stopAdapter(selected); return }
+    run.adapter = selected
+    await selected.start(player, (candidate) => { void onCandidate(run, candidate) })
+    if (!isCurrent(run)) { stopAdapter(selected); return }
     status.value = 'running'
   } catch (err) {
+    if (!isCurrent(run)) return
+    stopAdapter(run.adapter)
+    run.adapter = null
+    releaseStream(run.stream)
+    run.stream = null
+    stream.value = null
+    if (video.value) video.value.srcObject = null
+    camera.release()
     const e = err as { name?: string; message?: string }
     if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') {
       status.value = 'denied'
@@ -131,29 +161,35 @@ async function startCamera() {
   }
 }
 
-async function stopCamera() {
-  try { await adapter.value?.stop() } catch { /* noop */ }
-  adapter.value = null
-  if (stream.value) {
-    for (const t of stream.value.getTracks()) t.stop()
-    stream.value = null
+function stopCamera() {
+  const previous = session
+  session = null
+  releaseStream(previous?.stream ?? null)
+  if (previous) {
+    previous.stream = null
+    for (const timer of previous.timers) clearTimeout(timer)
+    previous.timers.clear()
   }
+  stream.value = null
   if (video.value) video.value.srcObject = null
   camera.release()
   gate.reset()
   status.value = 'idle'
+  flashSuccess.value = false
+  flashError.value = false
   manualOpen.value = false
   manualValue.value = ''
+  stopAdapter(previous?.adapter ?? null)
 }
 
 async function flipCamera() {
   camera.flip()
-  await stopCamera()
+  stopCamera()
   if (props.open) await startCamera()
 }
 
-async function onCandidate({ text, format }: { text: string; format: import('./types').ScanFormat }) {
-  if (!text) return
+async function onCandidate(run: ScanSession, { text, format }: { text: string; format: import('./types').ScanFormat }) {
+  if (!isCurrent(run) || !text) return
   if (!gate.accept(text)) return
   const result = await resolveScan(text, {
     context: props.context,
@@ -161,34 +197,45 @@ async function onCandidate({ text, format }: { text: string; format: import('./t
     format,
     scale: props.scale,
   })
+  if (!isCurrent(run)) return
   if (result.type === 'unknown') {
-    fireError()
+    fireError(run)
     // Still emit so the host can show a useful toast ('no se reconoció:
     // <raw>') instead of the user wondering whether anything happened.
     emit('result', result)
     return
   }
-  fireSuccess()
+  fireSuccess(run)
   emit('result', result)
-  if (props.closeOnSuccess) emit('close')
+  if (isCurrent(run) && props.closeOnSuccess) emit('close')
 }
 
-function fireSuccess() {
+function fireSuccess(run: ScanSession) {
   flashSuccess.value = true
   try { navigator.vibrate?.(60) } catch { /* noop */ }
-  setTimeout(() => (flashSuccess.value = false), 350)
+  scheduleFlash(run, () => { flashSuccess.value = false }, 350)
 }
-function fireError() {
+function fireError(run: ScanSession) {
   flashError.value = true
   try { navigator.vibrate?.([40, 40, 40]) } catch { /* noop */ }
-  setTimeout(() => (flashError.value = false), 600)
+  scheduleFlash(run, () => { flashError.value = false }, 600)
+}
+
+function scheduleFlash(run: ScanSession, reset: () => void, delay: number) {
+  const timer = setTimeout(() => {
+    run.timers.delete(timer)
+    if (isCurrent(run)) reset()
+  }, delay)
+  run.timers.add(timer)
 }
 
 async function submitManual() {
+  const run = session
+  if (!run) return
   const v = manualValue.value.trim()
   if (!v) return
-  await onCandidate({ text: v, format: 'unknown' })
-  manualValue.value = ''
+  await onCandidate(run, { text: v, format: 'unknown' })
+  if (isCurrent(run)) manualValue.value = ''
 }
 
 function onKey(e: KeyboardEvent) {
