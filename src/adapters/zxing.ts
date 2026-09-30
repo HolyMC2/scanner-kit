@@ -44,7 +44,7 @@ function mapFormat(zxFormat: unknown): ScanFormat {
 }
 
 export class ZxingAdapter implements ScannerAdapter {
-  private controls: ScannerControls | null = null
+  private session: { controls: ScannerControls | null } | null = null
 
   isAvailable(): boolean {
     return true
@@ -54,18 +54,28 @@ export class ZxingAdapter implements ScannerAdapter {
     video: HTMLVideoElement,
     onResult: (c: ScanCandidate) => void,
   ): Promise<void> {
+    void this.stop()
+    const run = { controls: null as ScannerControls | null }
+    this.session = run
     const api = await loadApi()
+    if (this.session !== run) return
     const reader = new api.BrowserMultiFormatReader()
-    this.controls = await reader.decodeFromVideoElement(video, (result, _err) => {
-      if (!result) return
+    const controls = await reader.decodeFromVideoElement(video, (result, _err) => {
+      if (this.session !== run || !result) return
       const text = result.getText()
       const fmt = result.getBarcodeFormat()
       if (text) onResult({ text, format: mapFormat(fmt) })
     })
+    if (this.session !== run) {
+      try { controls.stop() } catch { /* noop */ }
+      return
+    }
+    run.controls = controls
   }
 
   async stop(): Promise<void> {
-    try { this.controls?.stop() } catch { /* noop */ }
-    this.controls = null
+    const previous = this.session
+    this.session = null
+    try { previous?.controls?.stop() } catch { /* noop */ }
   }
 }

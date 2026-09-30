@@ -28,9 +28,10 @@ function mapFormat(f: string): ScanFormat {
 }
 
 export class NativeAdapter implements ScannerAdapter {
-  private detector: InstanceType<NonNullable<Window['BarcodeDetector']>> | null = null
-  private rafId: number | null = null
-  private stopped = false
+  private session: {
+    detector: InstanceType<NonNullable<Window['BarcodeDetector']>>
+    rafId: number | null
+  } | null = null
 
   async isAvailable(): Promise<boolean> {
     if (typeof window === 'undefined' || !window.BarcodeDetector) return false
@@ -50,13 +51,15 @@ export class NativeAdapter implements ScannerAdapter {
     onResult: (c: ScanCandidate) => void,
   ): Promise<void> {
     if (!window.BarcodeDetector) throw new Error('BarcodeDetector not available')
-    this.detector = new window.BarcodeDetector({ formats: NATIVE_FORMATS })
-    this.stopped = false
+    void this.stop()
+    const run = { detector: new window.BarcodeDetector({ formats: NATIVE_FORMATS }), rafId: null as number | null }
+    this.session = run
     let lastEmitAt = 0
     const tick = async () => {
-      if (this.stopped || !this.detector) return
+      if (this.session !== run) return
       try {
-        const results = await this.detector.detect(video)
+        const results = await run.detector.detect(video)
+        if (this.session !== run) return
         const now = Date.now()
         // Throttle to one emit per 800 ms to avoid double-fire.
         if (results.length && now - lastEmitAt > 800) {
@@ -67,15 +70,14 @@ export class NativeAdapter implements ScannerAdapter {
       } catch {
         // Detector errors on bad frames are normal; ignore and reschedule.
       }
-      this.rafId = requestAnimationFrame(tick)
+      if (this.session === run) run.rafId = requestAnimationFrame(tick)
     }
-    this.rafId = requestAnimationFrame(tick)
+    run.rafId = requestAnimationFrame(tick)
   }
 
   async stop(): Promise<void> {
-    this.stopped = true
-    if (this.rafId !== null) cancelAnimationFrame(this.rafId)
-    this.rafId = null
-    this.detector = null
+    const previous = this.session
+    this.session = null
+    if (previous?.rafId != null) cancelAnimationFrame(previous.rafId)
   }
 }

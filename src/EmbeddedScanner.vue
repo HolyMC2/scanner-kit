@@ -14,7 +14,7 @@
  * pins the two public contracts together so they cannot drift silently.
  */
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { pickAdapter, type ScannerAdapter } from './adapters'
+import { pickAdapter, type ScanCandidate, type ScannerAdapter } from './adapters'
 import { createDedupGate, resolveDedupWindow, type DedupPolicy } from './dedup'
 import { useCameraControls } from './cameraControls'
 
@@ -48,7 +48,18 @@ const emit = defineEmits<{
 
 const video = ref<HTMLVideoElement | null>(null)
 const stream = ref<MediaStream | null>(null)
-const adapter = ref<ScannerAdapter | null>(null)
+interface ScanSession {
+  stream: MediaStream | null
+  adapter: ScannerAdapter | null
+}
+let session: ScanSession | null = null
+function isCurrent(run: ScanSession) { return session === run && props.active }
+function releaseStream(value: MediaStream | null) {
+  for (const track of value?.getTracks() ?? []) track.stop()
+}
+function stopAdapter(value: ScannerAdapter | null) {
+  try { void value?.stop().catch(() => { /* cleanup is best effort */ }) } catch { /* noop */ }
+}
 const status = ref<EmbeddedStatus>('idle')
 const errorMsg = ref('')
 const camera = useCameraControls()
@@ -64,7 +75,9 @@ function setStatus(s: EmbeddedStatus) {
 }
 
 async function start() {
-  if (status.value === 'starting' || status.value === 'running') return
+  if (session) return
+  const run: ScanSession = { stream: null, adapter: null }
+  session = run
   setStatus('starting')
   errorMsg.value = ''
   try {
@@ -73,21 +86,40 @@ async function start() {
       errorMsg.value = 'Cámara no disponible — usa el modo manual.'
       return
     }
-    stream.value = await navigator.mediaDevices.getUserMedia({
+    const acquired = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: camera.facing.value } },
       audio: false,
     })
-    if (video.value) {
-      video.value.srcObject = stream.value
-      video.value.setAttribute('playsinline', 'true')
-      video.value.muted = true
-      await video.value.play().catch(() => { /* autoplay blocked is OK */ })
+    if (!isCurrent(run)) {
+      releaseStream(acquired)
+      return
     }
-    await camera.attach(stream.value)
-    adapter.value = await pickAdapter()
-    if (video.value) await adapter.value.start(video.value, onCandidate)
+    run.stream = acquired
+    stream.value = acquired
+    const player = video.value
+    if (!player) { stop(); return }
+    player.srcObject = acquired
+    player.setAttribute('playsinline', 'true')
+    player.muted = true
+    await player.play().catch(() => { /* autoplay blocked is OK */ })
+    if (!isCurrent(run)) return
+    await camera.attach(acquired)
+    if (!isCurrent(run)) return
+    const selected = await pickAdapter()
+    if (!isCurrent(run)) { stopAdapter(selected); return }
+    run.adapter = selected
+    await selected.start(player, (candidate) => onCandidate(run, candidate))
+    if (!isCurrent(run)) { stopAdapter(selected); return }
     setStatus('running')
   } catch (err) {
+    if (!isCurrent(run)) return
+    stopAdapter(run.adapter)
+    run.adapter = null
+    releaseStream(run.stream)
+    run.stream = null
+    stream.value = null
+    if (video.value) video.value.srcObject = null
+    camera.release()
     const e = err as { name?: string; message?: string }
     if (e?.name === 'NotAllowedError' || e?.name === 'SecurityError') {
       setStatus('denied')
@@ -99,28 +131,30 @@ async function start() {
   }
 }
 
-async function stop() {
-  try { await adapter.value?.stop() } catch { /* noop */ }
-  adapter.value = null
-  if (stream.value) {
-    for (const t of stream.value.getTracks()) t.stop()
-    stream.value = null
-  }
+function stop() {
+  // Revoke first; a pending permission, playback or adapter promise cannot
+  // publish into a subsequent opening. Release our tracks synchronously.
+  const previous = session
+  session = null
+  releaseStream(previous?.stream ?? null)
+  if (previous) previous.stream = null
+  stream.value = null
   if (video.value) video.value.srcObject = null
   camera.release()
   gate.reset()
   setStatus('idle')
+  stopAdapter(previous?.adapter ?? null)
 }
 
-function onCandidate({ text }: { text: string }) {
-  if (!text) return
+function onCandidate(run: ScanSession, { text }: ScanCandidate) {
+  if (!isCurrent(run) || !text) return
   if (!gate.accept(text)) return
   emit('code', text)
 }
 
 async function flipCamera() {
   camera.flip()
-  await stop()
+  stop()
   if (props.active) await start()
 }
 
